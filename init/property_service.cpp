@@ -209,6 +209,14 @@ static uint32_t PropertySet(const std::string& name, const std::string& value, s
     return PROP_SUCCESS;
 }
 
+// Helper for PropertySet, for the case where no socket is used, and therefore an asynchronous
+// return is not possible.
+static uint32_t PropertySetNoSocket(const std::string& name, const std::string& value,
+                                    std::string* error) {
+    auto ret = PropertySet(name, value, error);
+    return ret;
+}
+
 class AsyncRestorecon {
   public:
     void TriggerRestorecon(const std::string& path) {
@@ -513,6 +521,15 @@ uint32_t HandlePropertySet(const std::string& name, const std::string& value,
     return PropertySet(name, value, error);
 }
 
+// Helper for HandlePropertySet, for the case where no socket is used, and
+// therefore an asynchronous return is not possible.
+uint32_t HandlePropertySetNoSocket(const std::string& name, const std::string& value,
+                                   const std::string& source_context, const ucred& cr,
+                                   std::string* error) {
+    auto ret = HandlePropertySet(name, value, source_context, cr, nullptr, error);
+    return ret;
+}
+
 static void handle_property_set_fd() {
     static constexpr uint32_t kDefaultSocketTimeout = 2000; /* ms */
 
@@ -773,6 +790,50 @@ static void load_override_properties() {
     }
 }
 
+static const char *snet_prop_key[] = {
+	"ro.boot.vbmeta.device_state",
+	"ro.boot.verifiedbootstate",
+	"ro.boot.flash.locked",
+	"ro.boot.selinux",
+	"ro.boot.veritymode",
+	"ro.boot.warranty_bit",
+	"ro.warranty_bit",
+	"ro.debuggable",
+	"ro.secure",
+	"ro.build.type",
+	"ro.build.keys",
+	"ro.build.tags",
+	"ro.system.build.tags",
+	NULL
+};
+
+static const char *snet_prop_value[] = {
+	"locked", // ro.boot.vbmeta.device_state
+	"green", // ro.boot.verifiedbootstate
+	"1", // ro.boot.flash.locked
+	"enforcing", // ro.boot.selinux
+	"enforcing", // ro.boot.veritymode
+	"0", // ro.boot.warranty_bit
+	"0", // ro.warranty_bit
+	"0", // ro.debuggable
+	"1", // ro.secure
+	"user", // ro.build.type
+	"release-keys", // ro.build.keys
+	"release-keys", // ro.build.tags
+	"release-keys", // ro.system.build.tags
+	NULL
+};
+
+static void workaround_snet_properties() {
+	std::string error;
+	LOG(INFO) << "snet: Hiding sensitive props";
+
+	// Hide all sensitive props
+	for (int i = 0; snet_prop_key[i]; ++i) {
+		PropertySetNoSocket(snet_prop_key[i], snet_prop_value[i], &error);
+	}
+}
+
 // If the ro.product.[brand|device|manufacturer|model|name] properties have not been explicitly
 // set, derive them from ro.product.${partition}.* properties
 static void property_initialize_ro_product_props() {
@@ -923,6 +984,9 @@ void PropertyLoadBootDefaults() {
 
     property_initialize_ro_product_props();
     property_derive_build_fingerprint();
+
+    // Workaround SafetyNet
+    workaround_snet_properties();
 
     // Restore the normal property override security after init extension is executed
     weaken_prop_override_security = false;
