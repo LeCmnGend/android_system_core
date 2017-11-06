@@ -44,6 +44,7 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -51,7 +52,9 @@
 #include <android-base/chrono_utils.h>
 #include <android-base/file.h>
 #include <android-base/logging.h>
+#include <android-base/parseint.h>
 #include <android-base/properties.h>
+#include <android-base/result.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
 #include <property_info_parser/property_info_parser.h>
@@ -66,6 +69,7 @@
 #include "persistent_properties.h"
 #include "property_type.h"
 #include "proto_utils.h"
+#include "second_stage_resources.h"
 #include "selinux.h"
 #include "subcontext.h"
 #include "system/core/init/property_service.pb.h"
@@ -74,8 +78,12 @@
 
 using namespace std::literals;
 
+using android::base::ErrnoError;
+using android::base::Error;
 using android::base::GetProperty;
+using android::base::ParseInt;
 using android::base::ReadFileToString;
+using android::base::Result;
 using android::base::Split;
 using android::base::StartsWith;
 using android::base::StringPrintf;
@@ -92,6 +100,16 @@ using android::sysprop::InitProperties::is_userspace_reboot_supported;
 namespace android {
 namespace init {
 
+class PersistWriteThread;
+
+constexpr auto FINGERPRINT_PROP = "ro.build.fingerprint";
+constexpr auto LEGACY_FINGERPRINT_PROP = "ro.build.legacy.fingerprint";
+constexpr auto ID_PROP = "ro.build.id";
+constexpr auto LEGACY_ID_PROP = "ro.build.legacy.id";
+constexpr auto VBMETA_DIGEST_PROP = "ro.boot.vbmeta.digest";
+constexpr auto DIGEST_SIZE_USED = 8;
+constexpr auto API_LEVEL_CURRENT = 10000;
+
 static bool persistent_properties_loaded = false;
 
 static int property_set_fd = -1;
@@ -100,6 +118,8 @@ static int init_socket = -1;
 static bool accept_messages = false;
 static std::mutex accept_messages_lock;
 static std::thread property_service_thread;
+
+static std::unique_ptr<PersistWriteThread> persist_write_thread;
 
 static PropertyInfoAreaFile property_info_area;
 
@@ -165,48 +185,13 @@ static bool CheckMacPerms(const std::string& name, const char* target_context,
     return has_access;
 }
 
-static uint32_t PropertySet(const std::string& name, const std::string& value, std::string* error) {
-    size_t valuelen = value.size();
-
-    if (!IsLegalPropertyName(name)) {
-        *error = "Illegal property name";
-        return PROP_ERROR_INVALID_NAME;
-    }
-
-    if (auto result = IsLegalPropertyValue(name, value); !result.ok()) {
-        *error = result.error().message();
-        return PROP_ERROR_INVALID_VALUE;
-    }
-
-    prop_info* pi = (prop_info*) __system_property_find(name.c_str());
-    if (pi != nullptr) {
-        // ro.* properties are actually "write-once", unless the system decides to
-        if (StartsWith(name, "ro.") && !weaken_prop_override_security) {
-            *error = "Read-only property was already set";
-            return PROP_ERROR_READ_ONLY_PROPERTY;
-        }
-
-        __system_property_update(pi, value.c_str(), valuelen);
-    } else {
-        int rc = __system_property_add(name.c_str(), name.size(), value.c_str(), valuelen);
-        if (rc < 0) {
-            *error = "__system_property_add failed";
-            return PROP_ERROR_SET_FAILED;
-        }
-    }
-
-    // Don't write properties to disk until after we have read all default
-    // properties to prevent them from being overwritten by default values.
-    if (persistent_properties_loaded && StartsWith(name, "persist.")) {
-        WritePersistentProperty(name, value);
-    }
+void NotifyPropertyChange(const std::string& name, const std::string& value) {
     // If init hasn't started its main loop, then it won't be handling property changed messages
     // anyway, so there's no need to try to send them.
     auto lock = std::lock_guard{accept_messages_lock};
     if (accept_messages) {
         PropertyChanged(name, value);
     }
-    return PROP_SUCCESS;
 }
 
 class AsyncRestorecon {
@@ -247,7 +232,9 @@ class AsyncRestorecon {
 
 class SocketConnection {
   public:
+    SocketConnection() = default;
     SocketConnection(int socket, const ucred& cred) : socket_(socket), cred_(cred) {}
+    SocketConnection(SocketConnection&&) = default;
 
     bool RecvUint32(uint32_t* value, uint32_t* timeout_ms) {
         return RecvFully(value, sizeof(*value), timeout_ms);
@@ -288,13 +275,13 @@ class SocketConnection {
         if (!socket_.ok()) {
             return true;
         }
-        int result = TEMP_FAILURE_RETRY(send(socket_, &value, sizeof(value), 0));
+        int result = TEMP_FAILURE_RETRY(send(socket_.get(), &value, sizeof(value), 0));
         return result == sizeof(value);
     }
 
     bool GetSourceContext(std::string* source_context) const {
         char* c_source_context = nullptr;
-        if (getpeercon(socket_, &c_source_context) != 0) {
+        if (getpeercon(socket_.get(), &c_source_context) != 0) {
             return false;
         }
         *source_context = c_source_context;
@@ -306,15 +293,17 @@ class SocketConnection {
 
     const ucred& cred() { return cred_; }
 
+    SocketConnection& operator=(SocketConnection&&) = default;
+
   private:
     bool PollIn(uint32_t* timeout_ms) {
-        struct pollfd ufds[1];
-        ufds[0].fd = socket_;
-        ufds[0].events = POLLIN;
-        ufds[0].revents = 0;
+        struct pollfd ufd = {
+                .fd = socket_.get(),
+                .events = POLLIN,
+        };
         while (*timeout_ms > 0) {
             auto start_time = std::chrono::steady_clock::now();
-            int nr = poll(ufds, 1, *timeout_ms);
+            int nr = poll(&ufd, 1, *timeout_ms);
             auto now = std::chrono::steady_clock::now();
             auto time_elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time);
@@ -356,7 +345,7 @@ class SocketConnection {
                 return false;
             }
 
-            int result = TEMP_FAILURE_RETRY(recv(socket_, data, bytes_left, MSG_DONTWAIT));
+            int result = TEMP_FAILURE_RETRY(recv(socket_.get(), data, bytes_left, MSG_DONTWAIT));
             if (result <= 0) {
                 PLOG(ERROR) << "sys_prop: recv error";
                 return false;
@@ -376,8 +365,77 @@ class SocketConnection {
     unique_fd socket_;
     ucred cred_;
 
-    DISALLOW_IMPLICIT_CONSTRUCTORS(SocketConnection);
+    DISALLOW_COPY_AND_ASSIGN(SocketConnection);
 };
+
+class PersistWriteThread {
+  public:
+    PersistWriteThread();
+    void Write(std::string name, std::string value, SocketConnection socket);
+
+  private:
+    void Work();
+
+  private:
+    std::thread thread_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<std::tuple<std::string, std::string, SocketConnection>> work_;
+};
+
+static std::optional<uint32_t> PropertySet(const std::string& name, const std::string& value,
+                                           SocketConnection* socket, std::string* error) {
+    size_t valuelen = value.size();
+
+    if (!IsLegalPropertyName(name)) {
+        *error = "Illegal property name";
+        return {PROP_ERROR_INVALID_NAME};
+    }
+
+    if (auto result = IsLegalPropertyValue(name, value); !result.ok()) {
+        *error = result.error().message();
+        return {PROP_ERROR_INVALID_VALUE};
+    }
+
+    prop_info* pi = (prop_info*)__system_property_find(name.c_str());
+    if (pi != nullptr) {
+        // ro.* properties are actually "write-once", unless the system decides to
+        if (StartsWith(name, "ro.") && !weaken_prop_override_security) {
+            *error = "Read-only property was already set";
+            return {PROP_ERROR_READ_ONLY_PROPERTY};
+        }
+
+        __system_property_update(pi, value.c_str(), valuelen);
+    } else {
+        int rc = __system_property_add(name.c_str(), name.size(), value.c_str(), valuelen);
+        if (rc < 0) {
+            *error = "__system_property_add failed";
+            return {PROP_ERROR_SET_FAILED};
+        }
+    }
+
+    // Don't write properties to disk until after we have read all default
+    // properties to prevent them from being overwritten by default values.
+    if (socket && persistent_properties_loaded && StartsWith(name, "persist.")) {
+        if (persist_write_thread) {
+            persist_write_thread->Write(name, value, std::move(*socket));
+            return {};
+        }
+        WritePersistentProperty(name, value);
+    }
+
+    NotifyPropertyChange(name, value);
+    return {PROP_SUCCESS};
+}
+
+// Helper for PropertySet, for the case where no socket is used, and therefore an asynchronous
+// return is not possible.
+static uint32_t PropertySetNoSocket(const std::string& name, const std::string& value,
+                                    std::string* error) {
+    auto ret = PropertySet(name, value, nullptr, error);
+    CHECK(ret.has_value());
+    return *ret;
+}
 
 static uint32_t SendControlMessage(const std::string& msg, const std::string& name, pid_t pid,
                                    SocketConnection* socket, std::string* error) {
@@ -469,16 +527,17 @@ uint32_t CheckPermissions(const std::string& name, const std::string& value,
     return PROP_SUCCESS;
 }
 
-// This returns one of the enum of PROP_SUCCESS or PROP_ERROR*.
-uint32_t HandlePropertySet(const std::string& name, const std::string& value,
-                           const std::string& source_context, const ucred& cr,
-                           SocketConnection* socket, std::string* error) {
+// This returns one of the enum of PROP_SUCCESS or PROP_ERROR*, or std::nullopt
+// if asynchronous.
+std::optional<uint32_t> HandlePropertySet(const std::string& name, const std::string& value,
+                                          const std::string& source_context, const ucred& cr,
+                                          SocketConnection* socket, std::string* error) {
     if (auto ret = CheckPermissions(name, value, source_context, cr, error); ret != PROP_SUCCESS) {
-        return ret;
+        return {ret};
     }
 
     if (StartsWith(name, "ctl.")) {
-        return SendControlMessage(name.c_str() + 4, value, cr.pid, socket, error);
+        return {SendControlMessage(name.c_str() + 4, value, cr.pid, socket, error)};
     }
 
     // sys.powerctl is a special property that is used to make the device reboot.  We want to log
@@ -496,7 +555,7 @@ uint32_t HandlePropertySet(const std::string& name, const std::string& value,
                   << process_log_string;
         if (value == "reboot,userspace" && !is_userspace_reboot_supported().value_or(false)) {
             *error = "Userspace reboot is not supported by this device";
-            return PROP_ERROR_INVALID_VALUE;
+            return {PROP_ERROR_INVALID_VALUE};
         }
     }
 
@@ -507,10 +566,20 @@ uint32_t HandlePropertySet(const std::string& name, const std::string& value,
     if (name == kRestoreconProperty && cr.pid != 1 && !value.empty()) {
         static AsyncRestorecon async_restorecon;
         async_restorecon.TriggerRestorecon(value);
-        return PROP_SUCCESS;
+        return {PROP_SUCCESS};
     }
 
-    return PropertySet(name, value, error);
+    return PropertySet(name, value, socket, error);
+}
+
+// Helper for HandlePropertySet, for the case where no socket is used, and
+// therefore an asynchronous return is not possible.
+uint32_t HandlePropertySetNoSocket(const std::string& name, const std::string& value,
+                                   const std::string& source_context, const ucred& cr,
+                                   std::string* error) {
+    auto ret = HandlePropertySet(name, value, source_context, cr, nullptr, error);
+    CHECK(ret.has_value());
+    return *ret;
 }
 
 static void handle_property_set_fd() {
@@ -561,8 +630,7 @@ static void handle_property_set_fd() {
 
         const auto& cr = socket.cred();
         std::string error;
-        uint32_t result =
-                HandlePropertySet(prop_name, prop_value, source_context, cr, nullptr, &error);
+        auto result = HandlePropertySetNoSocket(prop_name, prop_value, source_context, cr, &error);
         if (result != PROP_SUCCESS) {
             LOG(ERROR) << "Unable to set property '" << prop_name << "' from uid:" << cr.uid
                        << " gid:" << cr.gid << " pid:" << cr.pid << ": " << error;
@@ -588,14 +656,19 @@ static void handle_property_set_fd() {
             return;
         }
 
+        // HandlePropertySet takes ownership of the socket if the set is handled asynchronously.
         const auto& cr = socket.cred();
         std::string error;
-        uint32_t result = HandlePropertySet(name, value, source_context, cr, &socket, &error);
-        if (result != PROP_SUCCESS) {
+        auto result = HandlePropertySet(name, value, source_context, cr, &socket, &error);
+        if (!result) {
+            // Result will be sent after completion.
+            return;
+        }
+        if (*result != PROP_SUCCESS) {
             LOG(ERROR) << "Unable to set property '" << name << "' from uid:" << cr.uid
                        << " gid:" << cr.gid << " pid:" << cr.pid << ": " << error;
         }
-        socket.SendUint32(result);
+        socket.SendUint32(*result);
         break;
       }
 
@@ -607,10 +680,9 @@ static void handle_property_set_fd() {
 }
 
 uint32_t InitPropertySet(const std::string& name, const std::string& value) {
-    uint32_t result = 0;
     ucred cr = {.pid = 1, .uid = 0, .gid = 0};
     std::string error;
-    result = HandlePropertySet(name, value, kInitContext, cr, nullptr, &error);
+    auto result = HandlePropertySetNoSocket(name, value, kInitContext, cr, &error);
     if (result != PROP_SUCCESS) {
         LOG(ERROR) << "Init cannot set '" << name << "' to '" << value << "': " << error;
     }
@@ -618,8 +690,8 @@ uint32_t InitPropertySet(const std::string& name, const std::string& value) {
     return result;
 }
 
-static bool load_properties_from_file(const char*, const char*,
-                                      std::map<std::string, std::string>*);
+static Result<void> load_properties_from_file(const char*, const char*,
+                                              std::map<std::string, std::string>*);
 
 /*
  * Filter is used to decide which properties to load: NULL loads all keys,
@@ -630,9 +702,11 @@ static void LoadProperties(char* data, const char* filter, const char* filename,
     char *key, *value, *eol, *sol, *tmp, *fn;
     size_t flen = 0;
 
-    static constexpr const char* const kVendorPathPrefixes[2] = {
+    static constexpr const char* const kVendorPathPrefixes[4] = {
             "/vendor",
             "/odm",
+            "/vendor_dlkm",
+            "/odm_dlkm",
     };
 
     const char* context = kInitContext;
@@ -678,7 +752,10 @@ static void LoadProperties(char* data, const char* filter, const char* filename,
                 continue;
             }
 
-            load_properties_from_file(expanded_filename->c_str(), key, properties);
+            if (auto res = load_properties_from_file(expanded_filename->c_str(), key, properties);
+                !res.ok()) {
+                LOG(WARNING) << res.error();
+            }
         } else {
             value = strchr(key, '=');
             if (!value) continue;
@@ -711,8 +788,8 @@ static void LoadProperties(char* data, const char* filter, const char* filename,
                 if (it == properties->end()) {
                     (*properties)[key] = value;
                 } else if (it->second != value) {
-                    LOG(WARNING) << "Overriding previous 'ro.' property '" << key << "':'"
-                                 << it->second << "' with new value '" << value << "'";
+                    LOG(WARNING) << "Overriding previous property '" << key << "':'" << it->second
+                                 << "' with new value '" << value << "'";
                     it->second = value;
                 }
             } else {
@@ -725,20 +802,30 @@ static void LoadProperties(char* data, const char* filter, const char* filename,
 
 // Filter is used to decide which properties to load: NULL loads all keys,
 // "ro.foo.*" is a prefix match, and "ro.foo.bar" is an exact match.
-static bool load_properties_from_file(const char* filename, const char* filter,
-                                      std::map<std::string, std::string>* properties) {
+static Result<void> load_properties_from_file(const char* filename, const char* filter,
+                                              std::map<std::string, std::string>* properties) {
     Timer t;
     auto file_contents = ReadFile(filename);
     if (!file_contents.ok()) {
-        PLOG(WARNING) << "Couldn't load property file '" << filename
-                      << "': " << file_contents.error();
-        return false;
+        return Error() << "Couldn't load property file '" << filename
+                       << "': " << file_contents.error();
     }
     file_contents->push_back('\n');
 
     LoadProperties(file_contents->data(), filter, filename, properties);
     LOG(VERBOSE) << "(Loading properties from " << filename << " took " << t << ".)";
-    return true;
+    return {};
+}
+
+static void LoadPropertiesFromSecondStageRes(std::map<std::string, std::string>* properties) {
+    std::string prop = GetRamdiskPropForSecondStage();
+    if (access(prop.c_str(), R_OK) != 0) {
+        CHECK(errno == ENOENT) << "Cannot access " << prop << ": " << strerror(errno);
+        return;
+    }
+    if (auto res = load_properties_from_file(prop.c_str(), nullptr, properties); !res.ok()) {
+        LOG(WARNING) << res.error();
+    }
 }
 
 // persist.sys.usb.config values can't be combined on build-time when property
@@ -765,12 +852,56 @@ static void load_override_properties() {
         load_properties_from_file("/data/local.prop", nullptr, &properties);
         for (const auto& [name, value] : properties) {
             std::string error;
-            if (PropertySet(name, value, &error) != PROP_SUCCESS) {
+            if (PropertySetNoSocket(name, value, &error) != PROP_SUCCESS) {
                 LOG(ERROR) << "Could not set '" << name << "' to '" << value
                            << "' in /data/local.prop: " << error;
             }
         }
     }
+}
+
+static const char *snet_prop_key[] = {
+	"ro.boot.vbmeta.device_state",
+	"ro.boot.verifiedbootstate",
+	"ro.boot.flash.locked",
+	"ro.boot.selinux",
+	"ro.boot.veritymode",
+	"ro.boot.warranty_bit",
+	"ro.warranty_bit",
+	"ro.debuggable",
+	"ro.secure",
+	"ro.build.type",
+	"ro.build.keys",
+	"ro.build.tags",
+	"ro.system.build.tags",
+	NULL
+};
+
+static const char *snet_prop_value[] = {
+	"locked", // ro.boot.vbmeta.device_state
+	"green", // ro.boot.verifiedbootstate
+	"1", // ro.boot.flash.locked
+	"enforcing", // ro.boot.selinux
+	"enforcing", // ro.boot.veritymode
+	"0", // ro.boot.warranty_bit
+	"0", // ro.warranty_bit
+	"0", // ro.debuggable
+	"1", // ro.secure
+	"user", // ro.build.type
+	"release-keys", // ro.build.keys
+	"release-keys", // ro.build.tags
+	"release-keys", // ro.system.build.tags
+	NULL
+};
+
+static void workaround_snet_properties() {
+	std::string error;
+	LOG(INFO) << "snet: Hiding sensitive props";
+
+	// Hide all sensitive props
+	for (int i = 0; snet_prop_key[i]; ++i) {
+		PropertySetNoSocket(snet_prop_key[i], snet_prop_value[i], &error);
+	}
 }
 
 // If the ro.product.[brand|device|manufacturer|model|name] properties have not been explicitly
@@ -831,7 +962,7 @@ static void property_initialize_ro_product_props() {
                 LOG(INFO) << "Setting product property " << base_prop << " to '" << target_prop_val
                           << "' (from " << target_prop << ")";
                 std::string error;
-                uint32_t res = PropertySet(base_prop, target_prop_val, &error);
+                auto res = PropertySetNoSocket(base_prop, target_prop_val, &error);
                 if (res != PROP_SUCCESS) {
                     LOG(ERROR) << "Error setting product property " << base_prop << ": err=" << res
                                << " (" << error << ")";
@@ -842,23 +973,44 @@ static void property_initialize_ro_product_props() {
     }
 }
 
-// If the ro.build.fingerprint property has not been set, derive it from constituent pieces
-static void property_derive_build_fingerprint() {
-    std::string build_fingerprint = GetProperty("ro.build.fingerprint", "");
-    if (!build_fingerprint.empty()) {
+static void property_initialize_build_id() {
+    std::string build_id = GetProperty(ID_PROP, "");
+    if (!build_id.empty()) {
         return;
     }
 
+    std::string legacy_build_id = GetProperty(LEGACY_ID_PROP, "");
+    std::string vbmeta_digest = GetProperty(VBMETA_DIGEST_PROP, "");
+    if (vbmeta_digest.size() < DIGEST_SIZE_USED) {
+        LOG(ERROR) << "vbmeta digest size too small " << vbmeta_digest;
+        // Still try to set the id field in the unexpected case.
+        build_id = legacy_build_id;
+    } else {
+        // Derive the ro.build.id by appending the vbmeta digest to the base value.
+        build_id = legacy_build_id + "." + vbmeta_digest.substr(0, DIGEST_SIZE_USED);
+    }
+
+    std::string error;
+    auto res = PropertySetNoSocket(ID_PROP, build_id, &error);
+    if (res != PROP_SUCCESS) {
+        LOG(ERROR) << "Failed to set " << ID_PROP << " to " << build_id;
+    }
+}
+
+static std::string ConstructBuildFingerprint(bool legacy) {
     const std::string UNKNOWN = "unknown";
-    build_fingerprint = GetProperty("ro.product.brand", UNKNOWN);
+    std::string build_fingerprint = GetProperty("ro.product.brand", UNKNOWN);
     build_fingerprint += '/';
     build_fingerprint += GetProperty("ro.product.name", UNKNOWN);
     build_fingerprint += '/';
     build_fingerprint += GetProperty("ro.product.device", UNKNOWN);
     build_fingerprint += ':';
-    build_fingerprint += GetProperty("ro.build.version.release", UNKNOWN);
+    build_fingerprint += GetProperty("ro.build.version.release_or_codename", UNKNOWN);
     build_fingerprint += '/';
-    build_fingerprint += GetProperty("ro.build.id", UNKNOWN);
+
+    std::string build_id =
+            legacy ? GetProperty(LEGACY_ID_PROP, UNKNOWN) : GetProperty(ID_PROP, UNKNOWN);
+    build_fingerprint += build_id;
     build_fingerprint += '/';
     build_fingerprint += GetProperty("ro.build.version.incremental", UNKNOWN);
     build_fingerprint += ':';
@@ -866,50 +1018,236 @@ static void property_derive_build_fingerprint() {
     build_fingerprint += '/';
     build_fingerprint += GetProperty("ro.build.tags", UNKNOWN);
 
-    LOG(INFO) << "Setting property 'ro.build.fingerprint' to '" << build_fingerprint << "'";
+    return build_fingerprint;
+}
+
+// Derive the legacy build fingerprint if we overwrite the build id at runtime.
+static void property_derive_legacy_build_fingerprint() {
+    std::string legacy_build_fingerprint = GetProperty(LEGACY_FINGERPRINT_PROP, "");
+    if (!legacy_build_fingerprint.empty()) {
+        return;
+    }
+
+    // The device doesn't have a legacy build id, skipping the legacy fingerprint.
+    std::string legacy_build_id = GetProperty(LEGACY_ID_PROP, "");
+    if (legacy_build_id.empty()) {
+        return;
+    }
+
+    legacy_build_fingerprint = ConstructBuildFingerprint(true /* legacy fingerprint */);
+    LOG(INFO) << "Setting property '" << LEGACY_FINGERPRINT_PROP << "' to '"
+              << legacy_build_fingerprint << "'";
 
     std::string error;
-    uint32_t res = PropertySet("ro.build.fingerprint", build_fingerprint, &error);
+    auto res = PropertySetNoSocket(LEGACY_FINGERPRINT_PROP, legacy_build_fingerprint, &error);
     if (res != PROP_SUCCESS) {
-        LOG(ERROR) << "Error setting property 'ro.build.fingerprint': err=" << res << " (" << error
-                   << ")";
+        LOG(ERROR) << "Error setting property '" << LEGACY_FINGERPRINT_PROP << "': err=" << res
+                   << " (" << error << ")";
+    }
+}
+
+// If the ro.build.fingerprint property has not been set, derive it from constituent pieces
+static void property_derive_build_fingerprint() {
+    std::string build_fingerprint = GetProperty("ro.build.fingerprint", "");
+    if (!build_fingerprint.empty()) {
+        return;
+    }
+
+    build_fingerprint = ConstructBuildFingerprint(false /* legacy fingerprint */);
+    LOG(INFO) << "Setting property '" << FINGERPRINT_PROP << "' to '" << build_fingerprint << "'";
+
+    std::string error;
+    auto res = PropertySetNoSocket(FINGERPRINT_PROP, build_fingerprint, &error);
+    if (res != PROP_SUCCESS) {
+        LOG(ERROR) << "Error setting property '" << FINGERPRINT_PROP << "': err=" << res << " ("
+                   << error << ")";
+    }
+}
+
+// If the ro.product.cpu.abilist* properties have not been explicitly
+// set, derive them from ro.${partition}.product.cpu.abilist* properties.
+static void property_initialize_ro_cpu_abilist() {
+    // From high to low priority.
+    const char* kAbilistSources[] = {
+            "product",
+            "odm",
+            "vendor",
+            "system",
+    };
+    const std::string EMPTY = "";
+    const char* kAbilistProp = "ro.product.cpu.abilist";
+    const char* kAbilist32Prop = "ro.product.cpu.abilist32";
+    const char* kAbilist64Prop = "ro.product.cpu.abilist64";
+
+    // If the properties are defined explicitly, just use them.
+    if (GetProperty(kAbilistProp, EMPTY) != EMPTY) {
+        return;
+    }
+
+    // Find the first source defining these properties by order.
+    std::string abilist32_prop_val;
+    std::string abilist64_prop_val;
+    for (const auto& source : kAbilistSources) {
+        const auto abilist32_prop = std::string("ro.") + source + ".product.cpu.abilist32";
+        const auto abilist64_prop = std::string("ro.") + source + ".product.cpu.abilist64";
+        abilist32_prop_val = GetProperty(abilist32_prop, EMPTY);
+        abilist64_prop_val = GetProperty(abilist64_prop, EMPTY);
+        // The properties could be empty on 32-bit-only or 64-bit-only devices,
+        // but we cannot identify a property is empty or undefined by GetProperty().
+        // So, we assume both of these 2 properties are empty as undefined.
+        if (abilist32_prop_val != EMPTY || abilist64_prop_val != EMPTY) {
+            break;
+        }
+    }
+
+    // Merge ABI lists for ro.product.cpu.abilist
+    auto abilist_prop_val = abilist64_prop_val;
+    if (abilist32_prop_val != EMPTY) {
+        if (abilist_prop_val != EMPTY) {
+            abilist_prop_val += ",";
+        }
+        abilist_prop_val += abilist32_prop_val;
+    }
+
+    // Set these properties
+    const std::pair<const char*, const std::string&> set_prop_list[] = {
+            {kAbilistProp, abilist_prop_val},
+            {kAbilist32Prop, abilist32_prop_val},
+            {kAbilist64Prop, abilist64_prop_val},
+    };
+    for (const auto& [prop, prop_val] : set_prop_list) {
+        LOG(INFO) << "Setting property '" << prop << "' to '" << prop_val << "'";
+
+        std::string error;
+        auto res = PropertySetNoSocket(prop, prop_val, &error);
+        if (res != PROP_SUCCESS) {
+            LOG(ERROR) << "Error setting property '" << prop << "': err=" << res << " (" << error
+                       << ")";
+        }
+    }
+}
+
+static int read_api_level_props(const std::vector<std::string>& api_level_props) {
+    int api_level = API_LEVEL_CURRENT;
+    for (const auto& api_level_prop : api_level_props) {
+        api_level = android::base::GetIntProperty(api_level_prop, API_LEVEL_CURRENT);
+        if (api_level != API_LEVEL_CURRENT) {
+            break;
+        }
+    }
+    return api_level;
+}
+
+static void property_initialize_ro_vendor_api_level() {
+    // ro.vendor.api_level shows the api_level that the vendor images (vendor, odm, ...) are
+    // required to support.
+    constexpr auto VENDOR_API_LEVEL_PROP = "ro.vendor.api_level";
+
+    // Api level properties of the board. The order of the properties must be kept.
+    std::vector<std::string> BOARD_API_LEVEL_PROPS = {"ro.board.api_level",
+                                                      "ro.board.first_api_level"};
+    // Api level properties of the device. The order of the properties must be kept.
+    std::vector<std::string> DEVICE_API_LEVEL_PROPS = {"ro.product.first_api_level",
+                                                       "ro.build.version.sdk"};
+
+    int api_level = std::min(read_api_level_props(BOARD_API_LEVEL_PROPS),
+                             read_api_level_props(DEVICE_API_LEVEL_PROPS));
+    std::string error;
+    auto res = PropertySetNoSocket(VENDOR_API_LEVEL_PROP, std::to_string(api_level), &error);
+    if (res != PROP_SUCCESS) {
+        LOG(ERROR) << "Failed to set " << VENDOR_API_LEVEL_PROP << " with " << api_level << ": "
+                   << error << "(" << res << ")";
     }
 }
 
 void PropertyLoadBootDefaults() {
-    // TODO(b/117892318): merge prop.default and build.prop files into one
     // We read the properties and their values into a map, in order to always allow properties
     // loaded in the later property files to override the properties in loaded in the earlier
     // property files, regardless of if they are "ro." properties or not.
     std::map<std::string, std::string> properties;
-    if (!load_properties_from_file("/system/etc/prop.default", nullptr, &properties)) {
-        // Try recovery path
-        if (!load_properties_from_file("/prop.default", nullptr, &properties)) {
-            // Try legacy path
-            load_properties_from_file("/default.prop", nullptr, &properties);
+
+    if (IsRecoveryMode()) {
+        if (auto res = load_properties_from_file("/prop.default", nullptr, &properties);
+            !res.ok()) {
+            LOG(ERROR) << res.error();
         }
     }
-    load_properties_from_file("/system/build.prop", nullptr, &properties);
-    load_properties_from_file("/system_ext/build.prop", nullptr, &properties);
-    load_properties_from_file("/vendor/default.prop", nullptr, &properties);
-    load_properties_from_file("/vendor/build.prop", nullptr, &properties);
-    if (SelinuxGetVendorAndroidVersion() >= __ANDROID_API_Q__) {
-        load_properties_from_file("/odm/etc/build.prop", nullptr, &properties);
-    } else {
-        load_properties_from_file("/odm/default.prop", nullptr, &properties);
-        load_properties_from_file("/odm/build.prop", nullptr, &properties);
+
+    // /<part>/etc/build.prop is the canonical location of the build-time properties since S.
+    // Falling back to /<part>/defalt.prop and /<part>/build.prop only when legacy path has to
+    // be supported, which is controlled by the support_legacy_path_until argument.
+    const auto load_properties_from_partition = [&properties](const std::string& partition,
+                                                              int support_legacy_path_until) {
+        auto path = "/" + partition + "/etc/build.prop";
+        if (load_properties_from_file(path.c_str(), nullptr, &properties).ok()) {
+            return;
+        }
+        // To read ro.<partition>.build.version.sdk, temporarily load the legacy paths into a
+        // separate map. Then by comparing its value with legacy_version, we know that if the
+        // partition is old enough so that we need to respect the legacy paths.
+        std::map<std::string, std::string> temp;
+        auto legacy_path1 = "/" + partition + "/default.prop";
+        auto legacy_path2 = "/" + partition + "/build.prop";
+        load_properties_from_file(legacy_path1.c_str(), nullptr, &temp);
+        load_properties_from_file(legacy_path2.c_str(), nullptr, &temp);
+        bool support_legacy_path = false;
+        auto version_prop_name = "ro." + partition + ".build.version.sdk";
+        auto it = temp.find(version_prop_name);
+        if (it == temp.end()) {
+            // This is embarassing. Without the prop, we can't determine how old the partition is.
+            // Let's be conservative by assuming it is very very old.
+            support_legacy_path = true;
+        } else if (int value;
+                   ParseInt(it->second.c_str(), &value) && value <= support_legacy_path_until) {
+            support_legacy_path = true;
+        }
+        if (support_legacy_path) {
+            // We don't update temp into properties directly as it might skip any (future) logic
+            // for resolving duplicates implemented in load_properties_from_file.  Instead, read
+            // the files again into the properties map.
+            load_properties_from_file(legacy_path1.c_str(), nullptr, &properties);
+            load_properties_from_file(legacy_path2.c_str(), nullptr, &properties);
+        } else {
+            LOG(FATAL) << legacy_path1 << " and " << legacy_path2 << " were not loaded "
+                       << "because " << version_prop_name << "(" << it->second << ") is newer "
+                       << "than " << support_legacy_path_until;
+        }
+    };
+
+    // Order matters here. The more the partition is specific to a product, the higher its
+    // precedence is.
+    LoadPropertiesFromSecondStageRes(&properties);
+
+    // system should have build.prop, unlike the other partitions
+    if (auto res = load_properties_from_file("/system/build.prop", nullptr, &properties);
+        !res.ok()) {
+        LOG(WARNING) << res.error();
     }
-    load_properties_from_file("/product/build.prop", nullptr, &properties);
-    load_properties_from_file("/factory/factory.prop", "ro.*", &properties);
+
+    load_properties_from_partition("system_ext", /* support_legacy_path_until */ 30);
+    load_properties_from_file("/system_dlkm/etc/build.prop", nullptr, &properties);
+    // TODO(b/117892318): uncomment the following condition when vendor.imgs for aosp_* targets are
+    // all updated.
+    // if (SelinuxGetVendorAndroidVersion() <= __ANDROID_API_R__) {
+    load_properties_from_file("/vendor/default.prop", nullptr, &properties);
+    // }
+    load_properties_from_file("/vendor/build.prop", nullptr, &properties);
+    load_properties_from_file("/vendor_dlkm/etc/build.prop", nullptr, &properties);
+    load_properties_from_file("/odm_dlkm/etc/build.prop", nullptr, &properties);
+    load_properties_from_partition("odm", /* support_legacy_path_until */ 28);
+    load_properties_from_partition("product", /* support_legacy_path_until */ 30);
 
     if (access(kDebugRamdiskProp, R_OK) == 0) {
         LOG(INFO) << "Loading " << kDebugRamdiskProp;
-        load_properties_from_file(kDebugRamdiskProp, nullptr, &properties);
+        if (auto res = load_properties_from_file(kDebugRamdiskProp, nullptr, &properties);
+            !res.ok()) {
+            LOG(WARNING) << res.error();
+        }
     }
 
     for (const auto& [name, value] : properties) {
         std::string error;
-        if (PropertySet(name, value, &error) != PROP_SUCCESS) {
+        if (PropertySetNoSocket(name, value, &error) != PROP_SUCCESS) {
             LOG(ERROR) << "Could not set '" << name << "' to '" << value
                        << "' while loading .prop files" << error;
         }
@@ -922,14 +1260,19 @@ void PropertyLoadBootDefaults() {
     vendor_load_properties();
 
     property_initialize_ro_product_props();
+    property_initialize_build_id();
     property_derive_build_fingerprint();
+    property_derive_legacy_build_fingerprint();
+    property_initialize_ro_cpu_abilist();
+    property_initialize_ro_vendor_api_level();
+
+    update_sys_usb_config();
+
+    // Workaround SafetyNet
+    workaround_snet_properties();
 
     // Restore the normal property override security after init extension is executed
     weaken_prop_override_security = false;
-
-    if (android::base::GetBoolProperty("ro.persistent_properties.ready", false)) {
-        update_sys_usb_config();
-    }
 }
 
 bool LoadPropertyInfoFromFile(const std::string& filename,
@@ -959,17 +1302,18 @@ void CreateSerializedPropertyInfo() {
                                       &property_infos)) {
             return;
         }
-        // Don't check for failure here, so we always have a sane list of properties.
+        // Don't check for failure here, since we don't always have all of these partitions.
         // E.g. In case of recovery, the vendor partition will not have mounted and we
         // still need the system / platform properties to function.
+        if (access("/dev/selinux/apex_property_contexts", R_OK) != -1) {
+            LoadPropertyInfoFromFile("/dev/selinux/apex_property_contexts", &property_infos);
+        }
         if (access("/system_ext/etc/selinux/system_ext_property_contexts", R_OK) != -1) {
             LoadPropertyInfoFromFile("/system_ext/etc/selinux/system_ext_property_contexts",
                                      &property_infos);
         }
-        if (!LoadPropertyInfoFromFile("/vendor/etc/selinux/vendor_property_contexts",
-                                      &property_infos)) {
-            // Fallback to nonplat_* if vendor_* doesn't exist.
-            LoadPropertyInfoFromFile("/vendor/etc/selinux/nonplat_property_contexts",
+        if (access("/vendor/etc/selinux/vendor_property_contexts", R_OK) != -1) {
+            LoadPropertyInfoFromFile("/vendor/etc/selinux/vendor_property_contexts",
                                      &property_infos);
         }
         if (access("/product/etc/selinux/product_property_contexts", R_OK) != -1) {
@@ -984,12 +1328,10 @@ void CreateSerializedPropertyInfo() {
             return;
         }
         LoadPropertyInfoFromFile("/system_ext_property_contexts", &property_infos);
-        if (!LoadPropertyInfoFromFile("/vendor_property_contexts", &property_infos)) {
-            // Fallback to nonplat_* if vendor_* doesn't exist.
-            LoadPropertyInfoFromFile("/nonplat_property_contexts", &property_infos);
-        }
+        LoadPropertyInfoFromFile("/vendor_property_contexts", &property_infos);
         LoadPropertyInfoFromFile("/product_property_contexts", &property_infos);
         LoadPropertyInfoFromFile("/odm_property_contexts", &property_infos);
+        LoadPropertyInfoFromFile("/dev/selinux/apex_property_contexts", &property_infos);
     }
 
     auto serialized_contexts = std::string();
@@ -1054,42 +1396,14 @@ static void ProcessKernelDt() {
     }
 }
 
+constexpr auto ANDROIDBOOT_PREFIX = "androidboot."sv;
+
 static void ProcessKernelCmdline() {
-    bool for_emulator = false;
     ImportKernelCmdline([&](const std::string& key, const std::string& value) {
-        if (key == "qemu") {
-            for_emulator = true;
-        } else if (StartsWith(key, "androidboot.")) {
-            InitPropertySet("ro.boot." + key.substr(12), value);
+        if (StartsWith(key, ANDROIDBOOT_PREFIX)) {
+            InitPropertySet("ro.boot." + key.substr(ANDROIDBOOT_PREFIX.size()), value);
         }
     });
-
-    if (for_emulator) {
-        ImportKernelCmdline([&](const std::string& key, const std::string& value) {
-            // In the emulator, export any kernel option with the "ro.kernel." prefix.
-            InitPropertySet("ro.kernel." + key, value);
-        });
-    }
-}
-
-static void SetSafetyNetProps() {
-    InitPropertySet("ro.boot.flash.locked", "1");
-    InitPropertySet("ro.boot.verifiedbootstate", "green");
-    InitPropertySet("ro.boot.veritymode", "enforcing");
-    InitPropertySet("ro.boot.vbmeta.device_state", "locked");
-    InitPropertySet("ro.boot.warranty_bit", "0");
-    InitPropertySet("ro.warranty_bit", "0");
-    InitPropertySet("ro.debuggable", "0");
-    InitPropertySet("ro.secure", "1");
-    InitPropertySet("ro.build.type", "user");
-    InitPropertySet("ro.build.keys", "release-keys");
-    InitPropertySet("ro.build.tags", "release-keys");
-    InitPropertySet("ro.system.build.tags", "release-keys");
-    InitPropertySet("ro.vendor.boot.warranty_bit", "0");
-    InitPropertySet("ro.vendor.warranty_bit", "0");
-    InitPropertySet("vendor.boot.vbmeta.device_state", "locked");
-    InitPropertySet("vendor.boot.verifiedbootstate", "green");
-    InitPropertySet("vendor.boot.veritymode", "enforcing");
 }
 
 void PropertyInit() {
@@ -1104,16 +1418,6 @@ void PropertyInit() {
     }
     if (!property_info_area.LoadDefaultPath()) {
         LOG(FATAL) << "Failed to load serialized property info file";
-    }
-
-    // Report a valid verified boot chain to make Google SafetyNet integrity
-    // checks pass. This needs to be done before parsing the kernel cmdline as
-    // these properties are read-only and will be set to invalid values with
-    // androidboot cmdline arguments.
-    if (SPOOF_SAFETYNET) {
-        if (!IsRecoveryMode()) {
-            SetSafetyNetProps();
-        }
     }
 
     // If arguments are passed both on the command line and in DT,
@@ -1150,6 +1454,11 @@ static void HandleInitSocket() {
                 InitPropertySet(persistent_property_record.name(),
                                 persistent_property_record.value());
             }
+            // Apply debug ramdisk special settings after persistent properties are loaded.
+            if (android::base::GetBoolProperty("ro.force.debuggable", false)) {
+                // Always enable usb adb if device is booted with debug ramdisk.
+                update_sys_usb_config();
+            }
             InitPropertySet("ro.persistent_properties.ready", "true");
             persistent_properties_loaded = true;
             break;
@@ -1175,15 +1484,51 @@ static void PropertyServiceThread() {
     }
 
     while (true) {
-        auto pending_functions = epoll.Wait(std::nullopt);
-        if (!pending_functions.ok()) {
-            LOG(ERROR) << pending_functions.error();
-        } else {
-            for (const auto& function : *pending_functions) {
-                (*function)();
-            }
+        auto epoll_result = epoll.Wait(std::nullopt);
+        if (!epoll_result.ok()) {
+            LOG(ERROR) << epoll_result.error();
         }
     }
+}
+
+PersistWriteThread::PersistWriteThread() {
+    auto new_thread = std::thread([this]() -> void { Work(); });
+    thread_.swap(new_thread);
+}
+
+void PersistWriteThread::Work() {
+    while (true) {
+        std::tuple<std::string, std::string, SocketConnection> item;
+
+        // Grab the next item within the lock.
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+
+            while (work_.empty()) {
+                cv_.wait(lock);
+            }
+
+            item = std::move(work_.front());
+            work_.pop_front();
+        }
+
+        std::this_thread::sleep_for(1s);
+
+        // Perform write/fsync outside the lock.
+        WritePersistentProperty(std::get<0>(item), std::get<1>(item));
+        NotifyPropertyChange(std::get<0>(item), std::get<1>(item));
+
+        SocketConnection& socket = std::get<2>(item);
+        socket.SendUint32(PROP_SUCCESS);
+    }
+}
+
+void PersistWriteThread::Write(std::string name, std::string value, SocketConnection socket) {
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        work_.emplace_back(std::move(name), std::move(value), std::move(socket));
+    }
+    cv_.notify_all();
 }
 
 void StartPropertyService(int* epoll_socket) {
@@ -1198,7 +1543,8 @@ void StartPropertyService(int* epoll_socket) {
     StartSendingMessages();
 
     if (auto result = CreateSocket(PROP_SERVICE_NAME, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
-                                   false, 0666, 0, 0, {});
+                                   /*should_listen=*/false, 0666, /*uid=*/0,
+                                   /*gid=*/0, /*socketcon=*/{});
         result.ok()) {
         property_set_fd = *result;
     } else {
@@ -1209,6 +1555,13 @@ void StartPropertyService(int* epoll_socket) {
 
     auto new_thread = std::thread{PropertyServiceThread};
     property_service_thread.swap(new_thread);
+
+    auto async_persist_writes =
+            android::base::GetBoolProperty("ro.property_service.async_persist_writes", false);
+
+    if (async_persist_writes) {
+        persist_write_thread = std::make_unique<PersistWriteThread>();
+    }
 }
 
 }  // namespace init
