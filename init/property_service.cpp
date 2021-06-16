@@ -1101,7 +1101,9 @@ void PropertyInit() {
     // these properties are read-only and will be set to invalid values with
     // androidboot cmdline arguments.
     if (SPOOF_SAFETYNET) {
-        SetSafetyNetProps();
+        if (!IsRecoveryMode()) {
+            SetSafetyNetProps();
+        }
     }
 
     // If arguments are passed both on the command line and in DT,
