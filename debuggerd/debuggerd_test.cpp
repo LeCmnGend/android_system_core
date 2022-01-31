@@ -72,7 +72,7 @@ constexpr char kWaitForGdbKey[] = "debug.debuggerd.wait_for_gdb";
     struct sigaction old_sigaction;                                \
     struct sigaction new_sigaction = {};                           \
     new_sigaction.sa_handler = [](int) {};                         \
-    if (sigaction(SIGALRM, &new_sigaction, &new_sigaction) != 0) { \
+    if (sigaction(SIGALRM, &new_sigaction, &old_sigaction) != 0) { \
       err(1, "sigaction failed");                                  \
     }                                                              \
     alarm(seconds);                                                \
